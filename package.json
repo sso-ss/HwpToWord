@@ -1,0 +1,27 @@
+{
+  "name": "hwp-to-word",
+  "version": "0.1.1",
+  "description": "Experimental local HWP 5 to editable Word DOCX converter",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "hwp-to-word": "bin/hwp-to-word.mjs"
+  },
+  "files": [
+    "bin/",
+    "convert_hwp.py",
+    "hwp_reader.py",
+    "requirements.txt",
+    "fonts-macos.json",
+    "LICENSE",
+    "README.md",
+    "README.ko.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": ["darwin", "linux"],
+  "scripts": {
+    "test": "node --test test/cli.test.mjs"
+  }
+}
