@@ -1,3 +1,2 @@
-pyhwp==0.1b15
-six==1.17.0
+olefile==0.47
 python-docx==1.2.0

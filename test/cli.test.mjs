@@ -14,7 +14,13 @@ test('help and version do not require Python', () => {
       encoding: 'utf8', env: { ...process.env, HWP_TO_WORD_PYTHON: '/missing/python' },
     });
     assert.equal(result.status, 0, result.stderr);
-    if (flag === '--help') assert.match(result.stdout, /Usage: hwp-to-word/);
+    if (flag === '--help') {
+      assert.match(result.stdout, /Usage: hwp-to-word/);
+      assert.match(result.stdout, /multiple sections/);
+      for (const option of ['--max-input-mb', '--max-stream-mb', '--max-expanded-mb', '--max-records', '--reader-timeout']) {
+        assert.ok(result.stdout.includes(option), `${option} should be documented`);
+      }
+    }
     else assert.equal(result.stdout.trim(), version);
   }
 });
@@ -31,7 +37,7 @@ test('Python discovery falls back and honors explicit executable paths', () => {
   assert.throws(() => findPython(() => ({ status: 1 }), {}), /Python 3.9/);
 });
 
-test('CLI runs through npm-style executable symlinks', () => {
+test('CLI runs through npm-style executable symlinks', { skip: process.platform === 'win32' }, () => {
   const directory = mkdtempSync(join(tmpdir(), 'hwp-cli-link-'));
   try {
     const link = join(directory, 'hwp-to-word');
@@ -44,15 +50,15 @@ test('CLI runs through npm-style executable symlinks', () => {
   }
 });
 
-test('runtime is cached after success and lock is removed after failure', () => {
+for (const platform of ['darwin', 'linux', 'win32']) test(`runtime is cached and cleans up installation locks on ${platform}`, () => {
   const cacheRoot = mkdtempSync(join(tmpdir(), 'hwp-cli-test-'));
   try {
-    assert.throws(() => ensureRuntime({ cacheRoot, python: 'python3', run: () => 1 }), /virtual environment/);
+    assert.throws(() => ensureRuntime({ cacheRoot, python: 'python3', platform, run: () => 1 }), /virtual environment/);
     let calls = 0;
-    const executable = ensureRuntime({ cacheRoot, python: 'python3', run: (command, args) => {
+    const executable = ensureRuntime({ cacheRoot, python: 'python3', platform, run: (command, args) => {
       calls += 1;
       if (args[1] === 'venv') {
-        const binary = join(args[2], 'bin', 'python');
+        const binary = platform === 'win32' ? join(args[2], 'Scripts', 'python.exe') : join(args[2], 'bin', 'python');
         mkdirSync(dirname(binary), { recursive: true });
         writeFileSync(binary, '');
       }
@@ -60,7 +66,7 @@ test('runtime is cached after success and lock is removed after failure', () => 
     } });
     assert.equal(calls, 2);
     assert.ok(existsSync(executable));
-    assert.equal(ensureRuntime({ cacheRoot, python: 'python3', run: () => assert.fail('cached runtime should not install') }), executable);
+    assert.equal(ensureRuntime({ cacheRoot, python: 'python3', platform, run: () => assert.fail('cached runtime should not install') }), executable);
   } finally {
     rmSync(cacheRoot, { recursive: true, force: true });
   }

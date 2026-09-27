@@ -5,17 +5,26 @@ English | [한국어](README.ko.md)
 Convert a local `.hwp` file into an editable Word document (`.docx`) from your
 terminal. Text and tables remain editable, and your original file is unchanged.
 
+This repository uses its own HWP 3 and HWP 5 parsers, implemented from Hancom's public
+format specification, with no `pyhwp` dependency or fallback. It still uses
+`olefile` for the HWP 5 file container and `python-docx` for Word output.
+The new HWP 3 reader uses only Python's standard library; no new dependency was
+added. HWP 3 support is an experimental subset, tested with synthetic fixtures.
+
 **Experimental:** formatting and page breaks may differ from the original.
-Review the result before sharing or submitting it. HWPX and Windows are not
-supported yet. This is a command-line tool, not a Word add-in.
+Review the result before sharing or submitting it. HWPX is not supported yet.
+Windows runtime paths are implemented and covered by simulated tests; conversion
+on an actual Windows machine still needs verification. This is a command-line
+tool, not a Word add-in.
 
 ## Before You Start
 
-- Use macOS or Linux.
+- Use macOS or Linux, or try the experimental Windows support.
 - Install [Node.js](https://nodejs.org/en/download) 18+ (includes `npx`) and
     [Python](https://www.python.org/downloads/) 3.9+.
-- Prepare a trusted, unprotected HWP 5 file, no larger than 50 MB, with one
-    document section. A section is a layout division, not a page: multi-page files can work.
+- Prepare a trusted, unprotected HWP 3 or HWP 5 file. The default input limit is
+    50 MiB; HWP 5 allows larger files with the options below and supports multiple
+    document sections. HWP 3 retains its 50 MiB and single-section limits.
 - Connect to the internet for the first run to download the tool and dependencies.
 
 Check your installed versions in Terminal:
@@ -44,6 +53,19 @@ If `npx` asks to install `hwp-to-word`, approve the installation to continue.
 The first conversion takes longer while it prepares a Python environment.
 You do not need to install Python dependencies yourself.
 
+### Run This Checkout
+
+To use the native parser in this repository, run the local CLI from the
+repository root:
+
+```sh
+node bin/hwp-to-word.mjs "input.hwp" "output.docx"
+```
+
+It prepares the Python dependencies automatically and accepts the same options
+shown below. `npx hwp-to-word` uses the published npm package, which may not yet
+include the changes in this checkout.
+
 ## Open and Check the Result
 
 Successful conversion creates two files:
@@ -57,19 +79,82 @@ Compare the text, tables, page breaks, and Korean fonts with the original.
 Missing fonts can change wrapping and spacing. If you increase font sizes,
 you may also need to adjust paragraph line spacing.
 
-The report checks text against the parser's output, table dimensions, and image
-counts. It does **not** prove that every source feature or the visual layout was
-preserved. `visual_layout_verified: false` means layout was not automatically
+The report checks text against the parser's output, table dimensions, section
+counts/page settings, and image counts. It does **not** prove that every source
+feature or the visual layout was preserved. `visual_layout_verified: false` means layout was not automatically
 verified; it does not by itself mean conversion failed.
+
+`"parser": "native-hwp3"` or `"parser": "native-hwp5"` identifies the reader
+used. The actual file signature selects the reader; both versions use `.hwp`.
 
 Existing output files and reports are not overwritten. To convert again, choose
 a new name, such as `output-v2.docx`.
 
 ## Optional Settings
 
+### Larger HWP 5 Files
+
+Use the local checkout to opt into larger resource budgets, for example:
+
+```sh
+node bin/hwp-to-word.mjs "large.hwp" "large.docx" --max-input-mb 200 --max-stream-mb 128 --max-expanded-mb 512 --max-records 500000 --reader-timeout 300
+```
+
+| Option | Default | Controls |
+| --- | --- | --- |
+| `--max-input-mb` | 50 | Input file size |
+| `--max-stream-mb` | 64 | Each stored or expanded HWP 5 stream |
+| `--max-expanded-mb` | 128 | Total expanded HWP 5 streams, including images |
+| `--max-records` | 200000 | Records in each HWP 5 stream |
+| `--reader-timeout` | 60 | Reader time in seconds |
+
+All values must be positive integers. Size options use MiB (1,048,576 bytes).
+Raising the input budget does not automatically raise the other budgets; errors
+identify the exhausted budget. HWP 3 keeps its existing internal limits.
+The report records the selected HWP 5 limits and reader timeout.
+
+Large documents can require substantially more memory than their input size.
+The CLI writes intermediate XML and extracted images to temporary files, avoiding
+base64 image copies in the intermediate document. Temporary images are removed
+after success or failure. The Word model and packaged image bytes still occupy
+memory. These options do not promise
+conversion of every file under the selected size or exact layout fidelity.
+
+### Multiple HWP 5 Sections
+
+Sections are read in numeric order and become separate Word sections with their
+own page size, orientation, margins, and header/footer distances. Each subsequent
+section starts a new Word page. Odd/even section starts and section numbering
+remain unsupported. A section without page settings
+inherits the preceding Word section's settings (or Word defaults for the first).
+Page inference, when enabled, resets at each section and requires every section
+to be single-column. The report verifies section count and explicit page settings;
+it does not verify pagination.
+
+### Links, Headers, and Footers
+
+HWP 5 hyperlinks to web, email, and FTP addresses remain clickable and keep their
+label formatting. Links must begin and end within one paragraph; nested links
+and links spanning paragraphs are rejected. File links, internal bookmark links,
+and unsupported addresses retain their displayed labels with a warning.
+
+Headers and footers defined in the first paragraph of each section support text,
+formatting, tables, supported images, and links. They can apply to both pages or
+separately to odd and even pages. Later sections inherit prior definitions unless
+they provide a replacement; an explicit empty definition clears inherited content.
+Repeated definitions for the same page selection, populated definitions later in
+a section, first-page hiding, and automatic page-number fields are not supported.
+Previously accepted documents containing only empty header/footer controls still
+convert. The report checks header/footer content, inheritance, and link targets.
+
+The existing text count/hash describe body text. Header/footer text is counted
+separately; table, image, and hyperlink counts include explicitly written
+header/footer stories. A definition written to both odd and even stories counts
+once in each story.
+
 ### Keep Original Page Starts
 
-For a single-column document, try:
+For a single-column HWP 5 document, try:
 
 ```sh
 npx hwp-to-word "input.hwp" "output-pages.docx" --preserve-source-pages
@@ -77,6 +162,8 @@ npx hwp-to-word "input.hwp" "output-pages.docx" --preserve-source-pages
 
 This estimates page starts from stored HWP line positions. It cannot guarantee
 identical wrapping or pagination and cannot be used for multicolumn documents.
+For HWP 3 this option reports a warning and adds no inferred page breaks;
+explicit paragraph page breaks are preserved automatically.
 
 ### Substitute Missing Fonts
 
@@ -98,7 +185,7 @@ change layout. Without this option, original font names are retained.
 
 ### Recover Invalid Text Encoding
 
-If a file fails to parse because of invalid UTF-16, you can explicitly try:
+If an HWP 5 file fails to parse because of invalid UTF-16, you can explicitly try:
 
 ```sh
 npx hwp-to-word "input.hwp" "output-recovered.docx" --recover-text
@@ -108,6 +195,8 @@ npx hwp-to-word "input.hwp" "output-recovered.docx" --recover-text
 (U+FFFD). Review `text_replacements` in the report and correct the affected text
 in Word. Recovery is not a general fix for every conversion error or a lossless
 repair of the original file.
+HWP 3 uses a different character encoding. This option does not replace or
+recover unsupported HWP 3 character codes.
 
 ## Troubleshooting
 
@@ -133,14 +222,43 @@ npx hwp-to-word --help
 
 ## Support and Limitations
 
-Supports editable text and tables, basic text formatting, merged cells, table
-borders and fills, page size, and margins. Image support is limited.
+### HWP 3 (experimental)
 
-Automatic lists, equations, vector drawings, populated headers and footers,
-captions, field behavior, and multiple sections are not implemented. Text boxes
-become editable body text. Hyperlink labels remain, but links are not active.
+- Recognizes binary HWP 3.x by its file signature; supports uncompressed input
+  and bounded gzip/raw DEFLATE decoding.
+- Converts ASCII and modern Hangul syllables, basic font styling, tabs, spaces,
+  paragraph spacing, page size/margins, and explicit paragraph page breaks.
+- Converts rectangular tables, ordinary merged cells, nested tables, and basic
+  cell borders. Text boxes become editable inline text.
+- Rejects legacy Hanja/symbol/old-Hangul codes, images, equations, fields,
+  headers/footers, footnotes, captions, diagonal cells, and column/section breaks.
+- Paragraph alignment becomes left alignment with a warning. Cell shading,
+  paragraph/page borders, character shadows/outlines, metadata, and exact
+  positioning are not preserved. Stored line boundaries do not reconstruct pages.
+
+**Real HWP 3 documents have not yet been verified.** Tests use files built from
+Hancom's published structures, including compression and failure cases. The
+specification refers to a separate manual for the full internal character map
+and DOS alignment ordering. Compatibility and visual fidelity need validation
+with genuine HWP 3 files; synthetic tests cannot establish either.
+
+### HWP 5
+
+Supports editable text and tables, basic text formatting, merged cells, table
+borders and fills, and multiple sections with individual page sizes, orientations,
+and margins. Image support is limited.
+
+Automatic lists, equations, vector drawings, captions, and fields other than
+the hyperlink subset above are not implemented. Text boxes become editable body
+text. Headers, footers, and active links follow the limits described above.
 Supported pictures are placed inline; floating positions, cropping, rotation,
 and effects are not preserved. A PDF preview is not generated.
+
+Unsupported controls, unsupported header/footer structures, captions, grouped
+pictures, vector-only drawings, and malformed structures are rejected rather
+than silently omitted. Legacy Hanyang private-use characters are retained as
+Unicode private-use characters, with a warning; glyph compatibility is not
+guaranteed. See [Parser Architecture](PARSER.md) for implementation and test scope.
 
 ## Privacy and Local Files
 
@@ -153,13 +271,26 @@ Only convert documents you trust. The parser is not sandboxed; size and time
 limits do not make malicious files safe. Reports may contain document-related
 information, so review them before sharing.
 
-## License
+## License and Third-Party Software
 
-[AGPL-3.0-or-later](LICENSE). You may redistribute and modify this software under
-the license terms. It is provided without warranty. Review source-sharing and
-network-use obligations before redistributing it or offering it as a service.
+This project is licensed under **AGPL-3.0-or-later**. See the [LICENSE](LICENSE)
+file for the full terms.
 
-Uses [pyhwp](https://github.com/mete0r/pyhwp) (AGPL-3.0-or-later) and python-docx
-(MIT). Based on [Hancom's public HWP specification](https://www.hancom.com/support/downloadCenter/hwpOwpml).
+The HWP 3 and HWP 5 parsers are implemented in this repository using
+[Hancom's public file-format specification](https://www.hancom.com/support/downloadCenter/hwpOwpml).
+The project does not depend on `pyhwp`.
+
+The converter uses these open-source libraries:
+
+| Library | Purpose | License |
+| --- | --- | --- |
+| `olefile` | Reads the OLE container used by HWP 5 files | BSD-2-Clause, with additional retained PIL notices |
+| `python-docx` | Creates editable Word documents | MIT |
+
+These libraries and their dependencies retain their own licenses. When
+redistributing them, preserve the required copyright notices, license terms,
+and disclaimers.
+
+Removing `pyhwp` does not change this project's AGPL-3.0-or-later license.
 
 본 제품은 한컴의 HWP 문서 파일(.hwp) 공개 문서를 참고하여 개발하였습니다.

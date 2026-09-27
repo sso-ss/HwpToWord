@@ -1,5 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
+from io import StringIO
+import json
+import os
 import tempfile
 import struct
+from threading import Barrier
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -8,7 +14,7 @@ from unittest.mock import patch
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
 
-from convert_hwp import Converter, read_hwp, validate_output
+from convert_hwp import Converter, main, publish_output, read_hwp, validate_output
 from hwp_reader import TextRecovery
 
 
@@ -29,7 +35,7 @@ def sample_root():
 
 class ConversionTests(unittest.TestCase):
     def test_agreement_tabs_cell_padding_and_source_page_break(self):
-        source = Path("5. 협력업체 업무협약서.hwp")
+        source = Path("output/5. 협력업체 업무협약서.hwp")
         if not source.exists():
             self.skipTest("Local fixture is unavailable.")
         root, warnings = read_hwp(source)
@@ -138,6 +144,82 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(converted.left_indent.pt, 54)
         self.assertEqual(converted.first_line_indent.pt, -54)
 
+    def test_table_page_break_precedes_table_and_is_not_repeated(self):
+        for mode in ("inferred", "explicit", "style"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root, columns = sample_root()
+                before = paragraph("Previous page")
+                before.find("LineSeg").set("y", "1000")
+                columns.append(before)
+                host = ET.SubElement(columns, "Paragraph")
+                if mode == "explicit":
+                    host.set("new-page", "1")
+                elif mode == "style":
+                    info = ET.SubElement(root, "DocInfo")
+                    ET.SubElement(info, "ParaShape")
+                    ET.SubElement(info, "ParaShape", {"start-new-page": "1"})
+                    host.set("parashape-id", "1")
+                line = ET.SubElement(host, "LineSeg", {"y": "0"})
+                for text in ("First table", "Second table"):
+                    table = ET.SubElement(line, "TableControl")
+                    body = ET.SubElement(table, "TableBody", {"rows": "1", "cols": "1"})
+                    row = ET.SubElement(body, "TableRow")
+                    cell = ET.SubElement(row, "TableCell", {"row": "0", "col": "0"})
+                    cell.append(paragraph(text))
+                ET.SubElement(line, "Text").text = "After tables"
+                output = Path(directory) / "page-break.docx"
+                Converter(root, [], preserve_source_pages=mode == "inferred").convert().save(output)
+                document = Document(output)
+                self.assertTrue(document.paragraphs[1].paragraph_format.page_break_before)
+                self.assertTrue(document.paragraphs[1].paragraph_format.keep_with_next)
+                self.assertIs(document.tables[0]._tbl.getprevious(), document.paragraphs[1]._p)
+                self.assertEqual(sum(p.paragraph_format.page_break_before is True
+                                     for p in document.paragraphs), 1)
+                self.assertEqual(document.paragraphs[-1].text, "After tables")
+                self.assertFalse(document.paragraphs[-1].paragraph_format.page_break_before)
+                self.assertTrue(validate_output(root, output)["text_preserved"])
+
+    def test_validation_rejects_missing_textbox_separators(self):
+        root, columns = sample_root()
+        host = paragraph("")
+        columns.append(host)
+        drawing = ET.SubElement(host.find("LineSeg"), "GShapeObjectControl")
+        textbox = ET.SubElement(drawing, "TextboxParagraphList")
+        first = paragraph("First")
+        line = first.find("LineSeg")
+        for control, text in (("TAB", "Second"), ("LINE_BREAK", "Third"), ("FIXWIDTH_SPACE", "Fourth")):
+            ET.SubElement(line, "ControlChar", {"name": control})
+            ET.SubElement(line, "Text").text = text
+        textbox.append(first)
+        textbox.append(paragraph("Fifth"))
+        expected = "First\tSecond\nThird\u2007Fourth\nFifth"
+        for separator in ("\t", "\n", "\u2007", "paragraph"):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as directory:
+                document = Document()
+                # Same letters, with exactly one separator lost.
+                damaged = expected.rsplit("\n", 1) if separator == "paragraph" else None
+                document.add_paragraph("".join(damaged) if damaged else expected.replace(separator, "", 1))
+                output = Path(directory) / "damaged.docx"
+                document.save(output)
+                with self.assertRaisesRegex(ValueError, "Text preservation"):
+                    validate_output(root, output)
+
+    def test_validation_ignores_tab_stop_definitions(self):
+        root, columns = sample_root()
+        info = ET.SubElement(root, "DocInfo")
+        ET.SubElement(info, "ParaShape", {"tabdef-id": "0"})
+        tabs = ET.SubElement(ET.SubElement(info, "TabDef"), "Array")
+        ET.SubElement(tabs, "Tab", {"pos": "7200", "kind": "left"})
+        host = paragraph("First")
+        ET.SubElement(host.find("LineSeg"), "ControlChar", {"name": "TAB"})
+        ET.SubElement(host.find("LineSeg"), "Text").text = "Second"
+        columns.append(host)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "tab-stops.docx"
+            Converter(root, []).convert().save(output)
+            self.assertEqual(Document(output).paragraphs[0].text, "First\tSecond")
+            self.assertTrue(validate_output(root, output)["text_preserved"])
+
     def test_unsupported_format(self):
         with self.assertRaisesRegex(ValueError, "not HWPX"):
             read_hwp(Path("input.hwpx"))
@@ -149,13 +231,14 @@ class ConversionTests(unittest.TestCase):
                 source.touch()
                 header = b"HWP Document File".ljust(32, b"\0") + bytes([0, 0, 0, 5]) + struct.pack("<I", flag)
                 with patch("convert_hwp.olefile.OleFileIO") as reader, patch("convert_hwp.subprocess.run") as process:
+                    reader.return_value.__enter__.return_value.get_size.return_value = len(header)
                     reader.return_value.__enter__.return_value.openstream.return_value.read.return_value = header
                     with self.assertRaisesRegex(ValueError, "protected"):
                         read_hwp(source)
                     process.assert_not_called()
 
     def test_sample_conversion(self):
-        source = Path("2025 멘토링 프로그램_하반기.hwp")
+        source = Path("output/2025 멘토링 프로그램_하반기.hwp")
         if not source.exists():
             self.skipTest("Local private fixture is not included in the repository.")
         root, warnings = read_hwp(source)
@@ -187,7 +270,7 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(document.tables[1].cell(0, 0).paragraphs[0].paragraph_format.line_spacing.pt, 12)
 
     def test_font_substitution_is_explicit_and_reported(self):
-        source = Path("2025 멘토링 프로그램_하반기.hwp")
+        source = Path("output/2025 멘토링 프로그램_하반기.hwp")
         if not source.exists():
             self.skipTest("Local fixture is unavailable.")
         root, warnings = read_hwp(source)
@@ -196,6 +279,103 @@ class ConversionTests(unittest.TestCase):
         title = document.tables[0].cell(0, 0).paragraphs[0].runs[0]
         self.assertEqual(title.font.name, "HeadLineA")
         self.assertIn("Font substitution: HY헤드라인M -> HeadLineA", converter.warnings)
+
+
+class PublicationTests(unittest.TestCase):
+    def test_files_created_during_conversion_are_preserved(self):
+        for destinations in (("document",), ("report",), ("document", "report")):
+            with self.subTest(destinations=destinations), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "result.docx"
+                report = output.with_suffix(".report.json")
+                paths = {"document": output, "report": report}
+                root, columns = sample_root()
+                columns.append(paragraph("New document"))
+
+                def competing_conversion(*args, **kwargs):
+                    for name in destinations:
+                        paths[name].write_bytes(b"Already published by another conversion")
+                    return root, []
+
+                with patch("sys.argv", ["convert_hwp.py", "input.hwp", str(output)]), \
+                        patch("convert_hwp.read_hwp", side_effect=competing_conversion), \
+                        redirect_stderr(StringIO()) as errors, self.assertRaises(SystemExit) as failure:
+                    main()
+                self.assertEqual(failure.exception.code, 1)
+                self.assertIn("already exists", errors.getvalue())
+                for name, path in paths.items():
+                    if name in destinations:
+                        self.assertEqual(path.read_bytes(), b"Already published by another conversion")
+                    else:
+                        self.assertFalse(path.exists())
+
+    def test_concurrent_publication_keeps_document_and_report_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.docx"
+            ready = Barrier(2)
+            candidates = []
+            for label in ("first", "second"):
+                candidate = Path(directory) / (label + ".docx")
+                document = Document()
+                document.add_paragraph(label)
+                document.save(candidate)
+                candidates.append(candidate)
+
+            def publish(candidate):
+                ready.wait(timeout=5)
+                try:
+                    publish_output(candidate, output, {"label": candidate.stem})
+                    return candidate.stem
+                except ValueError:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                results = list(workers.map(publish, candidates))
+            winners = [result for result in results if result is not None]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(Document(output).paragraphs[0].text, winners[0])
+            self.assertEqual(json.loads(output.with_suffix(".report.json").read_text()), {"label": winners[0]})
+
+    def test_failed_document_publication_removes_only_its_own_report(self):
+        for replace_report in (False, True):
+            with self.subTest(replace_report=replace_report), tempfile.TemporaryDirectory() as directory:
+                candidate = Path(directory) / "candidate.docx"
+                candidate.write_bytes(b"staged document")
+                output = Path(directory) / "result.docx"
+                report = output.with_suffix(".report.json")
+                link = os.link
+
+                def fail_document_link(source, destination):
+                    if destination == output:
+                        if replace_report:
+                            report.unlink()
+                            report.write_text("An unrelated replacement report")
+                        raise OSError("Document publication failed")
+                    link(source, destination)
+
+                with patch("convert_hwp.os.link", side_effect=fail_document_link), \
+                        self.assertRaisesRegex(OSError, "Document publication failed"):
+                    publish_output(candidate, output, {})
+                self.assertFalse(output.exists())
+                if replace_report:
+                    self.assertEqual(report.read_text(), "An unrelated replacement report")
+                else:
+                    self.assertFalse(report.exists())
+
+    def test_dangling_output_symlinks_are_not_replaced(self):
+        for suffix in (".docx", ".report.json"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                candidate = Path(directory) / "candidate.docx"
+                candidate.write_bytes(b"staged document")
+                output = Path(directory) / "result.docx"
+                occupied = output.with_suffix(suffix)
+                missing = Path(directory) / "missing"
+                occupied.symlink_to(missing)
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    publish_output(candidate, output, {})
+                self.assertTrue(occupied.is_symlink())
+                self.assertFalse(missing.exists())
+                other = output.with_suffix(".report.json") if suffix == ".docx" else output
+                self.assertFalse(other.exists())
 
 
 if __name__ == "__main__":
