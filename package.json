@@ -1,6 +1,6 @@
 {
   "name": "hwp-to-word",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Experimental local HWP 3 and HWP 5 to editable Word DOCX converter",
   "license": "AGPL-3.0-or-later",
   "type": "module",
